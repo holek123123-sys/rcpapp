@@ -179,6 +179,9 @@ class TimeEntry(Base):
     project_id = Column(Integer, ForeignKey("projects.id"))
     deck_id = Column(Integer, ForeignKey("project_decks.id"), nullable=True)
     position_id = Column(Integer, ForeignKey("job_positions.id"), nullable=True)
+    # Migawka czynności wybranych dla tego konkretnego wpisu. Dzięki temu
+    # późniejsza edycja czynności pokładu nie zmienia historii raportów.
+    activity_names = Column("activities", JSON, nullable=True)
     
     is_present = Column(Boolean, default=True)
     absence_reason = Column(String, nullable=True)
@@ -345,6 +348,7 @@ class TimeEntryCreate(BaseModel):
     project_id: Optional[int] = None
     deck_id: Optional[int] = None
     position_id: Optional[int] = None
+    activities: Optional[List[ActivityName]] = Field(default=None, max_length=50)
     is_present: bool = True
     absence_reason: Optional[str] = None  # Pole historyczne; nowy interfejs go nie używa.
     hours: Optional[float] = Field(default=None, gt=0, le=24)
@@ -445,6 +449,23 @@ def deck_activity_names(payload):
     return [name] if name else []
 
 
+def normalized_activity_names(names):
+    """Zwraca niepuste, unikalne nazwy z zachowaniem kolejności wyboru."""
+    return list(dict.fromkeys(str(name).strip() for name in (names or []) if str(name).strip()))
+
+
+def time_entry_activity_names(entry: TimeEntry):
+    # NULL oznacza wpis historyczny sprzed dodania wyboru czynności. Dla takich
+    # rekordów zachowujemy dotychczasowy opis pochodzący z pokładu.
+    if isinstance(entry.activity_names, list):
+        return normalized_activity_names(entry.activity_names)
+    return normalized_activity_names(entry.deck.activities if entry.deck else [])
+
+
+def time_entry_activity_label(entry: TimeEntry, empty_value=""):
+    return ", ".join(time_entry_activity_names(entry)) or empty_value
+
+
 def migrate_deck_targets_to_m2(db: Session):
     """Jednorazowo przenosi obowiązujące plany godzinowe bez zmiany historii wpisów."""
     migration_key = "deck_targets_m2_v2"
@@ -497,7 +518,7 @@ def generate_excel_bytes(db: Session, start_date=None, end_date=None):
         status_txt = "Obecny" if e.is_present else "Nieobecny"
         project_name = e.project.name if e.project else ""
         deck_name = e.deck.name if e.deck else ""
-        activity = e.deck.activity if e.deck else ""
+        activity = time_entry_activity_label(e)
         factor = e.conversion_factor_used
         if factor is None and e.deck and e.deck.conversion_factor > 0:
             factor = e.deck.conversion_factor
@@ -735,6 +756,8 @@ def run_schema_migrations():
             connection.execute(text("ALTER TABLE time_entries ADD COLUMN conversion_factor_used FLOAT"))
         if "meters_done" not in entry_columns:
             connection.execute(text("ALTER TABLE time_entries ADD COLUMN meters_done FLOAT"))
+        if "activities" not in entry_columns:
+            connection.execute(text("ALTER TABLE time_entries ADD COLUMN activities JSON"))
 
         deck_columns = {column["name"] for column in db_inspector.get_columns("project_decks")}
         if "activities" not in deck_columns:
@@ -1191,11 +1214,20 @@ def add_entries_batch(payload: BatchTimeEntryCreate, db: Session = Depends(get_d
         if not deck:
             raise HTTPException(status_code=400, detail="Wybrany pokład nie należy do projektu lub jest nieaktywny")
 
+        available_activities = normalized_activity_names(deck.activities)
+        selected_activities = normalized_activity_names(e.activities)
+        if available_activities and not selected_activities:
+            raise HTTPException(status_code=400, detail="Wybierz co najmniej jedną czynność wykonywaną przez pracownika")
+        unavailable_activities = [name for name in selected_activities if name not in available_activities]
+        if unavailable_activities:
+            raise HTTPException(status_code=400, detail="Wybrana czynność nie jest dostępna dla tego pokładu")
+
         ne = TimeEntry(
             worker_id=e.worker_id,
             project_id=e.project_id,
             deck_id=e.deck_id,
             position_id=e.position_id,
+            activity_names=selected_activities,
             is_present=True,
             absence_reason=None,
             hours=e.hours,
@@ -1254,7 +1286,8 @@ def get_entries(start: str = None, end: str = None, db: Session = Depends(get_db
             "project_category": e.project.category if e.project else "-",
             "deck_id": e.deck_id,
             "deck_name": e.deck.name if e.deck else "-",
-            "activity": e.deck.activity if e.deck else "-",
+            "activity": time_entry_activity_label(e, "-"),
+            "activities": time_entry_activity_names(e),
             "position": e.position.name if e.position else "-",
             "is_present": e.is_present,
             "hours": e.hours,
@@ -1311,10 +1344,11 @@ def monthly_summary(month: str, db: Session = Depends(get_db), _: User = Depends
             "decks": {},
         })
         project["total_hours"] += hours
-        deck_key = entry.deck_id or 0
+        activity_label = time_entry_activity_label(entry, "-")
+        deck_key = (entry.deck_id or 0, activity_label)
         deck = project["decks"].setdefault(deck_key, {
             "deck": entry.deck.name if entry.deck else "Bez pokładu",
-            "activity": entry.deck.activity if entry.deck else "-",
+            "activity": activity_label,
             "hours": 0.0,
         })
         deck["hours"] += hours
@@ -11907,21 +11941,35 @@ def serve_frontend(response: Response):
 
                                     <div>
                                         <label class="block text-sm font-bold text-slate-700 mb-2">Projekt</label>
-                                        <select v-model="entryForm.project_id" @change="entryForm.deck_id = ''" required class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none">
+                                        <select v-model="entryForm.project_id" @change="entryForm.deck_id = ''; entryForm.activities = []" required class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none">
                                             <option disabled value="">Wybierz projekt</option>
                                             <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
                                         </select>
                                     </div>
                                     <div>
                                         <label class="block text-sm font-bold text-slate-700 mb-2">Pokład</label>
-                                        <select v-model="entryForm.deck_id" required :disabled="!entryForm.project_id" class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none disabled:opacity-50">
+                                        <select v-model="entryForm.deck_id" @change="entryForm.activities = []" required :disabled="!entryForm.project_id" class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none disabled:opacity-50">
                                             <option disabled value="">Wybierz pokład</option>
                                             <option v-for="deck in selectedProjectDecks" :key="deck.id" :value="deck.id">{{ deck.name }}</option>
                                         </select>
                                     </div>
-                                    <div v-if="selectedDeck?.activity">
+                                    <div v-if="selectedDeckActivities.length">
                                         <label class="block text-sm font-bold text-slate-700 mb-2">Czynność</label>
-                                        <div class="w-full bg-indigo-50 border border-indigo-100 rounded-xl px-4 py-3 font-bold text-indigo-700">{{ selectedDeck?.activity || 'Wybierz pokład' }}</div>
+                                        <details class="activity-picker relative">
+                                            <summary aria-label="Wybierz czynności wykonywane przez pracownika" class="list-none cursor-pointer flex items-center justify-between gap-2 w-full bg-slate-50 border rounded-xl px-4 py-3 font-bold text-slate-700 focus-visible:ring-2 focus-visible:ring-emerald-500">
+                                                <span>{{ entryActivityNames(entryForm).length ? 'Wybrano: ' + entryActivityNames(entryForm).length : 'Wybierz czynność' }}</span><span aria-hidden="true">▾</span>
+                                            </summary>
+                                            <div role="group" aria-label="Czynności dostępne na wybranym pokładzie" class="absolute left-0 right-0 top-full z-30 mt-1 max-h-60 overflow-y-auto rounded-xl border border-slate-200 bg-white p-2 shadow-xl">
+                                                <label v-for="name in selectedDeckActivities" :key="name" class="flex min-h-[44px] items-center gap-3 rounded-lg px-3 py-2 font-medium hover:bg-emerald-50">
+                                                    <input type="checkbox" :checked="entryActivityNames(entryForm).includes(name)" @change="toggleEntryActivity(name, $event.target.checked)" class="w-5 h-5 shrink-0 accent-emerald-600">
+                                                    <span class="min-w-0 break-words">{{ name }}</span>
+                                                </label>
+                                            </div>
+                                        </details>
+                                        <div v-if="entryActivityNames(entryForm).length" class="mt-2 flex flex-wrap gap-1">
+                                            <span v-for="name in entryActivityNames(entryForm)" :key="name" class="inline-flex max-w-full items-center gap-1 rounded-lg bg-emerald-50 pl-2 text-xs font-bold text-emerald-700"><span class="min-w-0 break-words">{{ name }}</span><button type="button" @click="toggleEntryActivity(name, false)" :aria-label="'Odznacz czynność ' + name" class="h-8 w-8 shrink-0 rounded-lg text-lg hover:bg-emerald-100">×</button></span>
+                                        </div>
+                                        <p class="mt-2 text-xs text-slate-500">Możesz zaznaczyć kilka różnych czynności.</p>
                                     </div>
                                     <div>
                                         <label class="block text-sm font-bold text-slate-700 mb-2">Przepracowane godziny</label>
@@ -11944,7 +11992,7 @@ def serve_frontend(response: Response):
                                     <div v-for="(e, idx) in stagedEntries" :key="idx" class="bg-slate-50 p-3 rounded-xl border border-slate-100 flex justify-between items-center text-sm">
                                         <div>
                                             <span class="font-bold block">{{ getWorkerName(e.worker_id) }}</span>
-                                            <span class="text-emerald-600 font-bold">{{ getProjectName(e.project_id) }} / {{ getDeckName(e.deck_id) }} / {{ getDeckActivity(e.deck_id) }} / {{ e.hours }}h</span>
+                                            <span class="text-emerald-600 font-bold">{{ getProjectName(e.project_id) }} / {{ getDeckName(e.deck_id) }} / {{ getEntryActivityLabel(e) }} / {{ e.hours }}h</span>
                                         </div>
                                         <button type="button" @click="stagedEntries.splice(idx, 1)" class="text-rose-500 p-2 hover:bg-rose-100 rounded-lg"><i class="fa-solid fa-xmark"></i></button>
                                     </div>
@@ -12526,7 +12574,7 @@ def serve_frontend(response: Response):
                         workerClasses: ['Instalacja prowadzący', 'Instalacja pracownik', 'Prefabrykacja prowadzący', 'Prefabrykacja pracownik', 'Prefabrykacja', 'Światłowody', 'Inne', 'Biuro', 'Jędrek', 'Patryk'],
 
                         workerDropdownOpen: false,
-                        entryForm: { worker_id: '', project_id: '', deck_id: '', hours: null, description: '' },
+                        entryForm: { worker_id: '', project_id: '', deck_id: '', activities: [], hours: null, description: '' },
                         stagedEntries: [],
                         isSubmitting: false,
 
@@ -12591,6 +12639,9 @@ def serve_frontend(response: Response):
                     },
                     selectedDeck() {
                         return this.selectedProjectDecks.find(deck => Number(deck.id) === Number(this.entryForm.deck_id)) || null;
+                    },
+                    selectedDeckActivities() {
+                        return this.selectedDeck ? this.deckActivityNames(this.selectedDeck) : [];
                     },
                     selectedTargetProject() {
                         if (this.projectTargetId === 'new') return null;
@@ -12674,6 +12725,15 @@ def serve_frontend(response: Response):
                     getDeck(id) { for (const project of this.projects) { const deck = (project.decks || []).find(item => Number(item.id) === Number(id)); if (deck) return deck; } return null; },
                     getDeckName(id) { return this.getDeck(id)?.name || ''; },
                     getDeckActivity(id) { return this.getDeck(id)?.activity || ''; },
+                    entryActivityNames(entry) {
+                        const names = Array.isArray(entry?.activities) ? entry.activities : [];
+                        return [...new Set(names.map(name => String(name).trim()).filter(Boolean))];
+                    },
+                    toggleEntryActivity(name, checked) {
+                        const selected = this.entryActivityNames(this.entryForm);
+                        this.entryForm.activities = checked ? [...new Set([...selected, name])] : selected.filter(value => value !== name);
+                    },
+                    getEntryActivityLabel(entry) { return this.entryActivityNames(entry).join(', ') || 'Brak czynności'; },
                     formatHours(value) { return Number(value || 0).toFixed(1); },
                     formatMeters(value) { return Number(value || 0).toFixed(2); },
                     normalizeWorkerSearch(value) {
@@ -12921,10 +12981,11 @@ def serve_frontend(response: Response):
                     stageEntry() {
                         if(!this.entryForm.worker_id) return this.showToast('Wybierz pracownika', 'error');
                         if (!this.entryForm.project_id || !this.entryForm.deck_id || !this.entryForm.hours) return this.showToast('Wybierz projekt, pokład i wpisz godziny', 'error');
-                        const staged = { ...this.entryForm, is_present: true };
+                        if (this.selectedDeckActivities.length && !this.entryActivityNames(this.entryForm).length) return this.showToast('Wybierz co najmniej jedną czynność', 'error');
+                        const staged = { ...this.entryForm, activities: this.entryActivityNames(this.entryForm), is_present: true };
                         this.stagedEntries.push(staged);
                         this.showToast('Dodano do listy');
-                        this.entryForm.worker_id = ''; this.entryForm.hours = null; this.entryForm.description = '';
+                        this.entryForm.worker_id = ''; this.entryForm.activities = []; this.entryForm.hours = null; this.entryForm.description = '';
                     },
                     async submitBatch() {
                         if (!this.stagedEntries.length) return;
