@@ -131,7 +131,7 @@ class Project(Base):
     __tablename__ = "projects"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
-    category = Column(String, default=WorkerClass.INSTALLATION_WORKER.value)
+    category = Column(String, default="Instalacja")
     estimated_hours = Column(Float, default=0.0)
     total_m2 = Column(Float, nullable=True) 
     entries = relationship("TimeEntry", back_populates="project")
@@ -321,7 +321,7 @@ class DeckResponse(DeckCreate):
 
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    category: str = Field(default=WorkerClass.INSTALLATION_WORKER.value, max_length=50)
+    category: str = Field(default="Instalacja", max_length=50)
     estimated_hours: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     decks: List[DeckCreate] = Field(default_factory=list)
 
@@ -424,13 +424,13 @@ def calculate_meters(hours: Optional[float], conversion_factor: Optional[float])
     return round(float(hours) * float(conversion_factor), 4)
 
 
-PROJECT_CATEGORIES = {worker_class.value for worker_class in WorkerClass} | {"Instalacja"}
+PROJECT_CATEGORIES = {"Instalacja", "Prefabrykacja", "Światłowody", "Inne", "Biuro", "Jędrek", "Patryk"}
 
 
 def validate_project_category(category: str) -> str:
     normalized = str(category or "").strip()
     if normalized not in PROJECT_CATEGORIES:
-        raise HTTPException(status_code=400, detail="Typ projektu musi odpowiadać jednej z klas pracowników")
+        raise HTTPException(status_code=400, detail="Wybierz prawidłowy typ projektu powiązany z klasą pracowników")
     return normalized
 
 
@@ -12352,12 +12352,12 @@ def serve_frontend(response: Response):
                                         </div>
                                         <div v-if="projectTargetId === 'new'" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                             <div class="min-w-0"><label class="block text-xs uppercase font-black text-slate-400 mb-2">Nazwa projektu</label><input type="text" v-model="newProject.name" placeholder="Nazwa nowego projektu" class="w-full min-w-0 bg-slate-50 border rounded-xl px-4 py-3"></div>
-                                            <div class="min-w-0"><label class="block text-xs uppercase font-black text-slate-400 mb-2">Typ projektu / klasa pracownika</label><select v-model="newProject.category" class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-bold"><option v-for="workerClass in workerClasses" :key="workerClass" :value="workerClass">{{ workerClass }}</option></select></div>
+                                            <div class="min-w-0"><label class="block text-xs uppercase font-black text-slate-400 mb-2">Typ projektu / klasa pracownika</label><select v-model="newProject.category" class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-bold"><option v-for="projectType in projectTypes" :key="projectType" :value="projectType">{{ projectType }}</option></select></div>
                                         </div>
                                         <div v-else-if="selectedTargetProject" class="bg-sky-50 border border-sky-100 rounded-2xl p-4">
                                             <p class="text-sky-800 font-bold mb-3 break-words">Edytujesz projekt: {{ selectedTargetProject.name }}</p>
                                             <div class="flex flex-col sm:flex-row gap-3">
-                                                <select v-model="selectedTargetProject.category" class="flex-1 min-w-0 bg-white border rounded-xl px-4 py-3 font-bold"><option v-for="workerClass in workerClasses" :key="workerClass" :value="workerClass">{{ workerClass }}</option><option v-if="!workerClasses.includes(selectedTargetProject.category)" :value="selectedTargetProject.category" disabled>{{ selectedTargetProject.category }} — starszy typ, wybierz klasę</option></select>
+                                                <select v-model="selectedTargetProject.category" class="flex-1 min-w-0 bg-white border rounded-xl px-4 py-3 font-bold"><option v-for="projectType in projectTypes" :key="projectType" :value="projectType">{{ projectType }}</option><option v-if="!projectTypes.includes(selectedTargetProject.category)" :value="selectedTargetProject.category" disabled>{{ selectedTargetProject.category }} — wybierz wspólny typ</option></select>
                                                 <button type="button" @click="saveProjectDetails" class="px-5 py-3 bg-sky-600 text-white font-bold rounded-xl">Zapisz typ projektu</button>
                                             </div>
                                         </div>
@@ -12601,7 +12601,7 @@ def serve_frontend(response: Response):
                         newWorker: { first_name: '', last_name: '', worker_class: 'Inne', is_active: true, can_report_hours: false, email: '', login_password: '' },
                         isAddingWorker: false,
                         projectTargetId: 'new',
-                        newProject: { name: '', category: 'Instalacja pracownik', estimated_hours: 0, decks: [{ name: '', activity: '', activities: [], conversion_factor: '', target_m2: '', target_hours: '' }] },
+                        newProject: { name: '', category: 'Instalacja', estimated_hours: 0, decks: [{ name: '', activity: '', activities: [], conversion_factor: '', target_m2: '', target_hours: '' }] },
                         newActivity: { name: '' },
                         newUser: { email: '', role: 'manager', password: '', worker_id: '' },
                         newSubscriptionEmail: '',
@@ -12645,6 +12645,13 @@ def serve_frontend(response: Response):
                     },
                     selectedWorkerUsesActivitiesOnly() {
                         return this.selectedWorkerInfo?.worker_class === 'Światłowody';
+                    },
+                    projectTypes() {
+                        return [...new Set(this.workerClasses.map(workerClass => {
+                            if (workerClass.startsWith('Instalacja')) return 'Instalacja';
+                            if (workerClass.startsWith('Prefabrykacja')) return 'Prefabrykacja';
+                            return workerClass;
+                        }))];
                     },
                     availableProjects() {
                         const workerClass = this.selectedWorkerInfo?.worker_class;
@@ -13232,7 +13239,7 @@ def serve_frontend(response: Response):
                         try {
                             if (this.projectTargetId === 'new') {
                                 await this.api('projects', 'POST', { ...this.newProject, decks: normalizedDecks });
-                                this.newProject = {name:'', category:'Instalacja pracownik', estimated_hours:0, decks:[{name:'', activity:'', activities:[], conversion_factor:'', target_m2:'', target_hours:''}]};
+                                this.newProject = {name:'', category:'Instalacja', estimated_hours:0, decks:[{name:'', activity:'', activities:[], conversion_factor:'', target_m2:'', target_hours:''}]};
                             } else {
                                 for (const deck of normalizedDecks) {
                                     await this.api(`projects/${this.projectTargetId}/decks`, 'POST', deck);
@@ -13246,7 +13253,7 @@ def serve_frontend(response: Response):
                     },
                     async saveProjectDetails() {
                         if (!this.selectedTargetProject) return;
-                        if (!this.workerClasses.includes(this.selectedTargetProject.category)) return this.showToast('Wybierz klasę pracownika dla projektu', 'error');
+                        if (!this.projectTypes.includes(this.selectedTargetProject.category)) return this.showToast('Wybierz typ projektu powiązany z klasą pracowników', 'error');
                         try {
                             await this.api(`projects/${this.selectedTargetProject.id}`, 'PUT', {
                                 name: this.selectedTargetProject.name,
