@@ -179,9 +179,6 @@ class TimeEntry(Base):
     project_id = Column(Integer, ForeignKey("projects.id"))
     deck_id = Column(Integer, ForeignKey("project_decks.id"), nullable=True)
     position_id = Column(Integer, ForeignKey("job_positions.id"), nullable=True)
-    # Migawka czynności wybranych dla tego konkretnego wpisu. Dzięki temu
-    # późniejsza edycja czynności pokładu nie zmienia historii raportów.
-    activity_names = Column("activities", JSON, nullable=True)
     
     is_present = Column(Boolean, default=True)
     absence_reason = Column(String, nullable=True)
@@ -348,7 +345,6 @@ class TimeEntryCreate(BaseModel):
     project_id: Optional[int] = None
     deck_id: Optional[int] = None
     position_id: Optional[int] = None
-    activities: Optional[List[ActivityName]] = Field(default=None, max_length=50)
     is_present: bool = True
     absence_reason: Optional[str] = None  # Pole historyczne; nowy interfejs go nie używa.
     hours: Optional[float] = Field(default=None, gt=0, le=24)
@@ -449,23 +445,6 @@ def deck_activity_names(payload):
     return [name] if name else []
 
 
-def normalized_activity_names(names):
-    """Zwraca niepuste, unikalne nazwy z zachowaniem kolejności wyboru."""
-    return list(dict.fromkeys(str(name).strip() for name in (names or []) if str(name).strip()))
-
-
-def time_entry_activity_names(entry: TimeEntry):
-    # NULL oznacza wpis historyczny sprzed dodania wyboru czynności. Dla takich
-    # rekordów zachowujemy dotychczasowy opis pochodzący z pokładu.
-    if isinstance(entry.activity_names, list):
-        return normalized_activity_names(entry.activity_names)
-    return normalized_activity_names(entry.deck.activities if entry.deck else [])
-
-
-def time_entry_activity_label(entry: TimeEntry, empty_value=""):
-    return ", ".join(time_entry_activity_names(entry)) or empty_value
-
-
 def migrate_deck_targets_to_m2(db: Session):
     """Jednorazowo przenosi obowiązujące plany godzinowe bez zmiany historii wpisów."""
     migration_key = "deck_targets_m2_v2"
@@ -489,8 +468,10 @@ def sync_project_totals(db: Session, project: Project):
     project.estimated_hours = round(total_hours, 4)
     project.total_m2 = round(total_m2, 4)
 
-def generate_excel_bytes(db: Session, start_date=None, end_date=None):
+def generate_excel_bytes(db: Session, start_date=None, end_date=None, project_id: Optional[int] = None):
     query = db.query(TimeEntry).order_by(TimeEntry.date_created.desc())
+    if project_id is not None:
+        query = query.filter(TimeEntry.project_id == project_id)
     
     if start_date:
         if isinstance(start_date, str): start_date = datetime.strptime(start_date, "%Y-%m-%d")
@@ -518,7 +499,7 @@ def generate_excel_bytes(db: Session, start_date=None, end_date=None):
         status_txt = "Obecny" if e.is_present else "Nieobecny"
         project_name = e.project.name if e.project else ""
         deck_name = e.deck.name if e.deck else ""
-        activity = time_entry_activity_label(e)
+        activity = e.deck.activity if e.deck else (e.position.name if e.position else "")
         factor = e.conversion_factor_used
         if factor is None and e.deck and e.deck.conversion_factor > 0:
             factor = e.deck.conversion_factor
@@ -756,8 +737,6 @@ def run_schema_migrations():
             connection.execute(text("ALTER TABLE time_entries ADD COLUMN conversion_factor_used FLOAT"))
         if "meters_done" not in entry_columns:
             connection.execute(text("ALTER TABLE time_entries ADD COLUMN meters_done FLOAT"))
-        if "activities" not in entry_columns:
-            connection.execute(text("ALTER TABLE time_entries ADD COLUMN activities JSON"))
 
         deck_columns = {column["name"] for column in db_inspector.get_columns("project_decks")}
         if "activities" not in deck_columns:
@@ -1204,35 +1183,45 @@ def add_entries_batch(payload: BatchTimeEntryCreate, db: Session = Depends(get_d
 
         if not e.is_present:
             raise HTTPException(status_code=400, detail="Nieobecność wynika z braku wpisu RCP i nie jest zapisywana ręcznie")
-        if e.project_id is None or e.deck_id is None or e.hours is None:
-            raise HTTPException(status_code=400, detail="Wybierz projekt, pokład i liczbę godzin")
-        deck = db.query(ProjectDeck).filter(
-            ProjectDeck.id == e.deck_id,
-            ProjectDeck.project_id == e.project_id,
-            ProjectDeck.is_active.is_(True),
-        ).first()
-        if not deck:
-            raise HTTPException(status_code=400, detail="Wybrany pokład nie należy do projektu lub jest nieaktywny")
+        if e.hours is None:
+            raise HTTPException(status_code=400, detail="Wpisz liczbę godzin")
 
-        available_activities = normalized_activity_names(deck.activities)
-        selected_activities = normalized_activity_names(e.activities)
-        if available_activities and not selected_activities:
-            raise HTTPException(status_code=400, detail="Wybierz co najmniej jedną czynność wykonywaną przez pracownika")
-        unavailable_activities = [name for name in selected_activities if name not in available_activities]
-        if unavailable_activities:
-            raise HTTPException(status_code=400, detail="Wybrana czynność nie jest dostępna dla tego pokładu")
+        is_fiber_optics = worker.worker_class == WorkerClass.FIBER_OPTICS.value
+        if is_fiber_optics:
+            if e.position_id is None:
+                raise HTTPException(status_code=400, detail="Dla klasy Światłowody wybierz czynność")
+            position = db.query(JobPosition).filter(
+                JobPosition.id == e.position_id,
+                JobPosition.is_active.is_(True),
+            ).first()
+            if not position:
+                raise HTTPException(status_code=400, detail="Wybrana czynność nie istnieje lub jest nieaktywna")
+            project_id = None
+            deck_id = None
+            deck = None
+        else:
+            if e.project_id is None or e.deck_id is None:
+                raise HTTPException(status_code=400, detail="Wybierz projekt i pokład")
+            deck = db.query(ProjectDeck).filter(
+                ProjectDeck.id == e.deck_id,
+                ProjectDeck.project_id == e.project_id,
+                ProjectDeck.is_active.is_(True),
+            ).first()
+            if not deck:
+                raise HTTPException(status_code=400, detail="Wybrany pokład nie należy do projektu lub jest nieaktywny")
+            project_id = e.project_id
+            deck_id = e.deck_id
 
         ne = TimeEntry(
             worker_id=e.worker_id,
-            project_id=e.project_id,
-            deck_id=e.deck_id,
+            project_id=project_id,
+            deck_id=deck_id,
             position_id=e.position_id,
-            activity_names=selected_activities,
             is_present=True,
             absence_reason=None,
             hours=e.hours,
-            conversion_factor_used=deck.conversion_factor if deck.conversion_factor > 0 else None,
-            meters_done=calculate_meters(e.hours, deck.conversion_factor),
+            conversion_factor_used=deck.conversion_factor if deck and deck.conversion_factor > 0 else None,
+            meters_done=calculate_meters(e.hours, deck.conversion_factor) if deck else None,
             description=e.description,
             recorded_by_id=current_user.id
         )
@@ -1286,8 +1275,7 @@ def get_entries(start: str = None, end: str = None, db: Session = Depends(get_db
             "project_category": e.project.category if e.project else "-",
             "deck_id": e.deck_id,
             "deck_name": e.deck.name if e.deck else "-",
-            "activity": time_entry_activity_label(e, "-"),
-            "activities": time_entry_activity_names(e),
+            "activity": e.deck.activity if e.deck else (e.position.name if e.position else "-"),
             "position": e.position.name if e.position else "-",
             "is_present": e.is_present,
             "hours": e.hours,
@@ -1298,9 +1286,12 @@ def get_entries(start: str = None, end: str = None, db: Session = Depends(get_db
     return res
 
 @app.get("/api/reports/export")
-def export_excel(start: str = None, end: str = None, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def export_excel(start: str = None, end: str = None, project_id: Optional[int] = None,
+                 db: Session = Depends(get_db), _: User = Depends(require_admin)):
     try:
-        excel_bytes = generate_excel_bytes(db, start, end)
+        if project_id is not None and not db.get(Project, project_id):
+            raise HTTPException(status_code=404, detail="Nie znaleziono projektu")
+        excel_bytes = generate_excel_bytes(db, start, end, project_id=project_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Nieprawidłowy format daty; użyj RRRR-MM-DD")
     stream = io.BytesIO(excel_bytes)
@@ -1344,11 +1335,10 @@ def monthly_summary(month: str, db: Session = Depends(get_db), _: User = Depends
             "decks": {},
         })
         project["total_hours"] += hours
-        activity_label = time_entry_activity_label(entry, "-")
-        deck_key = (entry.deck_id or 0, activity_label)
+        deck_key = entry.deck_id or 0
         deck = project["decks"].setdefault(deck_key, {
             "deck": entry.deck.name if entry.deck else "Bez pokładu",
-            "activity": activity_label,
+            "activity": entry.deck.activity if entry.deck else (entry.position.name if entry.position else "-"),
             "hours": 0.0,
         })
         deck["hours"] += hours
@@ -11939,37 +11929,32 @@ def serve_frontend(response: Response):
                                         </div>
                                     </div>
 
-                                    <div>
-                                        <label class="block text-sm font-bold text-slate-700 mb-2">Projekt</label>
-                                        <select v-model="entryForm.project_id" @change="entryForm.deck_id = ''; entryForm.activities = []" required class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none">
-                                            <option disabled value="">Wybierz projekt</option>
-                                            <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
+                                    <div v-if="selectedWorkerUsesActivitiesOnly">
+                                        <label class="block text-sm font-bold text-slate-700 mb-2">Czynność</label>
+                                        <select v-model="entryForm.position_id" required class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none">
+                                            <option disabled value="">Wybierz czynność</option>
+                                            <option v-for="position in positions" :key="position.id" :value="position.id">{{ position.name }}</option>
                                         </select>
+                                        <p class="mt-2 text-xs font-medium text-slate-500">Dla klasy Światłowody projekt i pokład nie są wymagane.</p>
                                     </div>
-                                    <div>
+                                    <div v-else>
+                                        <label class="block text-sm font-bold text-slate-700 mb-2">Projekt</label>
+                                        <select v-model="entryForm.project_id" @change="entryForm.deck_id = ''" required class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none">
+                                            <option disabled value="">Wybierz projekt</option>
+                                            <option v-for="p in availableProjects" :key="p.id" :value="p.id">{{ p.name }}</option>
+                                        </select>
+                                        <p v-if="selectedWorkerInfo && !availableProjects.length" class="mt-2 text-xs font-bold text-amber-600">Brak projektu przypisanego do klasy {{ selectedWorkerInfo.worker_class }}.</p>
+                                    </div>
+                                    <div v-if="!selectedWorkerUsesActivitiesOnly">
                                         <label class="block text-sm font-bold text-slate-700 mb-2">Pokład</label>
-                                        <select v-model="entryForm.deck_id" @change="entryForm.activities = []" required :disabled="!entryForm.project_id" class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none disabled:opacity-50">
+                                        <select v-model="entryForm.deck_id" required :disabled="!entryForm.project_id" class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none disabled:opacity-50">
                                             <option disabled value="">Wybierz pokład</option>
                                             <option v-for="deck in selectedProjectDecks" :key="deck.id" :value="deck.id">{{ deck.name }}</option>
                                         </select>
                                     </div>
-                                    <div v-if="selectedDeckActivities.length">
+                                    <div v-if="!selectedWorkerUsesActivitiesOnly && selectedDeck?.activity">
                                         <label class="block text-sm font-bold text-slate-700 mb-2">Czynność</label>
-                                        <details class="activity-picker relative">
-                                            <summary aria-label="Wybierz czynności wykonywane przez pracownika" class="list-none cursor-pointer flex items-center justify-between gap-2 w-full bg-slate-50 border rounded-xl px-4 py-3 font-bold text-slate-700 focus-visible:ring-2 focus-visible:ring-emerald-500">
-                                                <span>{{ entryActivityNames(entryForm).length ? 'Wybrano: ' + entryActivityNames(entryForm).length : 'Wybierz czynność' }}</span><span aria-hidden="true">▾</span>
-                                            </summary>
-                                            <div role="group" aria-label="Czynności dostępne na wybranym pokładzie" class="absolute left-0 right-0 top-full z-30 mt-1 max-h-60 overflow-y-auto rounded-xl border border-slate-200 bg-white p-2 shadow-xl">
-                                                <label v-for="name in selectedDeckActivities" :key="name" class="flex min-h-[44px] items-center gap-3 rounded-lg px-3 py-2 font-medium hover:bg-emerald-50">
-                                                    <input type="checkbox" :checked="entryActivityNames(entryForm).includes(name)" @change="toggleEntryActivity(name, $event.target.checked)" class="w-5 h-5 shrink-0 accent-emerald-600">
-                                                    <span class="min-w-0 break-words">{{ name }}</span>
-                                                </label>
-                                            </div>
-                                        </details>
-                                        <div v-if="entryActivityNames(entryForm).length" class="mt-2 flex flex-wrap gap-1">
-                                            <span v-for="name in entryActivityNames(entryForm)" :key="name" class="inline-flex max-w-full items-center gap-1 rounded-lg bg-emerald-50 pl-2 text-xs font-bold text-emerald-700"><span class="min-w-0 break-words">{{ name }}</span><button type="button" @click="toggleEntryActivity(name, false)" :aria-label="'Odznacz czynność ' + name" class="h-8 w-8 shrink-0 rounded-lg text-lg hover:bg-emerald-100">×</button></span>
-                                        </div>
-                                        <p class="mt-2 text-xs text-slate-500">Możesz zaznaczyć kilka różnych czynności.</p>
+                                        <div class="w-full bg-indigo-50 border border-indigo-100 rounded-xl px-4 py-3 font-bold text-indigo-700">{{ selectedDeck?.activity || 'Wybierz pokład' }}</div>
                                     </div>
                                     <div>
                                         <label class="block text-sm font-bold text-slate-700 mb-2">Przepracowane godziny</label>
@@ -11992,7 +11977,8 @@ def serve_frontend(response: Response):
                                     <div v-for="(e, idx) in stagedEntries" :key="idx" class="bg-slate-50 p-3 rounded-xl border border-slate-100 flex justify-between items-center text-sm">
                                         <div>
                                             <span class="font-bold block">{{ getWorkerName(e.worker_id) }}</span>
-                                            <span class="text-emerald-600 font-bold">{{ getProjectName(e.project_id) }} / {{ getDeckName(e.deck_id) }} / {{ getEntryActivityLabel(e) }} / {{ e.hours }}h</span>
+                                            <span v-if="isFiberWorkerId(e.worker_id)" class="text-emerald-600 font-bold">{{ getPositionName(e.position_id) }} / {{ e.hours }}h</span>
+                                            <span v-else class="text-emerald-600 font-bold">{{ getProjectName(e.project_id) }} / {{ getDeckName(e.deck_id) }} / {{ getDeckActivity(e.deck_id) }} / {{ e.hours }}h</span>
                                         </div>
                                         <button type="button" @click="stagedEntries.splice(idx, 1)" class="text-rose-500 p-2 hover:bg-rose-100 rounded-lg"><i class="fa-solid fa-xmark"></i></button>
                                     </div>
@@ -12194,6 +12180,27 @@ def serve_frontend(response: Response):
                         <!-- ZAKŁADKA 4: ANALIZY I EXCEL (.xlsx) -->
                         <div v-else-if="currentTab === 'analysis'" class="space-y-6">
                             <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-200">
+                                <div ref="analysisProjectPicker" class="relative mb-5">
+                                    <label for="analysis-project-search" class="block text-xs font-bold text-slate-400 uppercase mb-2">Wyszukaj projekt</label>
+                                    <div class="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1 focus-within:border-indigo-400 focus-within:bg-white focus-within:ring-4 focus-within:ring-indigo-50">
+                                        <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-100 text-indigo-600" aria-hidden="true"><i class="fa-solid fa-magnifying-glass"></i></span>
+                                        <input id="analysis-project-search" type="text" v-model="analysisProjectSearch" @focus="analysisProjectPickerOpen = true" @click="analysisProjectPickerOpen = true" @input="onAnalysisProjectSearchInput" @keydown.enter.prevent="selectFirstAnalysisProject" @keydown.esc="analysisProjectPickerOpen = false" role="combobox" aria-autocomplete="list" aria-haspopup="listbox" :aria-expanded="analysisProjectPickerOpen" aria-controls="analysis-project-options" autocomplete="off" :spellcheck="false" placeholder="Wpisz nazwę albo numer projektu…" class="min-w-0 flex-1 bg-transparent border-0 outline-none py-3 font-semibold text-slate-800 placeholder:font-normal placeholder:text-slate-400">
+                                        <button v-if="analysisProjectSearch" type="button" @mousedown.prevent @click="clearAnalysisProject" aria-label="Wyczyść filtr projektu" title="Wyczyść" class="h-10 w-10 shrink-0 rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
+                                        <button type="button" @mousedown.prevent @click="analysisProjectPickerOpen = !analysisProjectPickerOpen" :aria-label="analysisProjectPickerOpen ? 'Zwiń listę projektów' : 'Rozwiń listę projektów'" :aria-expanded="analysisProjectPickerOpen" aria-controls="analysis-project-options" class="h-10 w-10 shrink-0 rounded-lg text-slate-500 hover:bg-indigo-50 hover:text-indigo-600"><i class="fa-solid fa-chevron-down text-xs" :class="analysisProjectPickerOpen ? 'rotate-180' : ''" aria-hidden="true"></i></button>
+                                    </div>
+                                    <div v-if="analysisProjectPickerOpen" class="absolute top-full left-0 right-0 z-30 mt-2 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl">
+                                        <div class="flex items-center justify-between gap-2 border-b border-slate-100 bg-slate-50 px-4 py-3"><span class="text-xs font-bold text-slate-500">Projekty</span><span role="status" class="rounded-md bg-white border px-2 py-0.5 text-xs font-bold text-slate-500">Wyniki: {{ analysisProjectOptions.length }}</span></div>
+                                        <div id="analysis-project-options" role="listbox" aria-label="Wybierz projekt do analizy" class="max-h-64 overflow-y-auto p-2">
+                                            <button v-for="project in analysisProjectOptions" :key="project.id" type="button" role="option" :aria-selected="Number(analysisProjectId) === Number(project.id)" @mousedown.prevent @click="selectAnalysisProject(project)" class="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left hover:bg-indigo-50">
+                                                <span class="shrink-0 rounded-lg bg-slate-100 px-2 py-1 text-xs font-black text-slate-600">#{{ project.id }}</span>
+                                                <span class="min-w-0 flex-1"><span class="block break-words text-sm font-bold text-slate-800">{{ project.name }}</span><span class="block mt-0.5 text-xs font-semibold text-slate-500">{{ project.category }}</span></span>
+                                                <i v-if="Number(analysisProjectId) === Number(project.id)" class="fa-solid fa-circle-check text-indigo-500" aria-hidden="true"></i>
+                                            </button>
+                                            <p v-if="!analysisProjectOptions.length" class="px-4 py-6 text-center text-sm font-bold text-slate-500">Nie znaleziono projektu.</p>
+                                        </div>
+                                    </div>
+                                    <p class="mt-2 text-xs text-slate-400">Wpisz numer projektu, np. 12, albo wyszukaj po nazwie i wybierz z listy. Puste pole pokazuje wszystkie projekty.</p>
+                                </div>
                                 <div class="flex flex-col sm:flex-row gap-4 items-end">
                                     <div class="flex-1">
                                         <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Zakres dat dla tabeli i pliku Excel</label>
@@ -12221,7 +12228,7 @@ def serve_frontend(response: Response):
                                 </div>
                             </div>
 
-                            <div v-if="reportEntriesByClass.length === 0" class="bg-white rounded-3xl p-10 text-center text-slate-400 font-bold border">Brak wpisów w wybranym zakresie.</div>
+                            <div v-if="reportEntriesByClass.length === 0" class="bg-white rounded-3xl p-10 text-center text-slate-400 font-bold border">Brak wpisów dla wybranego projektu i zakresu.</div>
                             <div v-for="group in reportEntriesByClass" :key="group.name" class="bg-white rounded-3xl shadow-sm border border-slate-200 p-4 md:p-7">
                                 <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-5">
                                     <h3 class="text-xl font-black text-slate-800"><i class="fa-solid fa-layer-group text-indigo-500 mr-2"></i>{{ group.name }}</h3>
@@ -12350,7 +12357,7 @@ def serve_frontend(response: Response):
                                         <div v-else-if="selectedTargetProject" class="bg-sky-50 border border-sky-100 rounded-2xl p-4">
                                             <p class="text-sky-800 font-bold mb-3 break-words">Edytujesz projekt: {{ selectedTargetProject.name }}</p>
                                             <div class="flex flex-col sm:flex-row gap-3">
-                                                <select v-model="selectedTargetProject.category" class="flex-1 min-w-0 bg-white border rounded-xl px-4 py-3 font-bold"><option value="Instalacja">Instalacja</option><option value="Prefabrykacja">Prefabrykacja</option><option v-if="selectedTargetProject.category === 'OGÓLNY'" value="OGÓLNY" disabled>Nie ustawiono typu</option></select>
+                                                <select v-model="selectedTargetProject.category" class="flex-1 min-w-0 bg-white border rounded-xl px-4 py-3 font-bold"><option value="Instalacja">Instalacja</option><option value="Prefabrykacja">Prefabrykacja</option><option v-if="!['Instalacja', 'Prefabrykacja'].includes(selectedTargetProject.category)" :value="selectedTargetProject.category" disabled>Nie ustawiono prawidłowego typu</option></select>
                                                 <button type="button" @click="saveProjectDetails" class="px-5 py-3 bg-sky-600 text-white font-bold rounded-xl">Zapisz typ projektu</button>
                                             </div>
                                         </div>
@@ -12574,12 +12581,15 @@ def serve_frontend(response: Response):
                         workerClasses: ['Instalacja prowadzący', 'Instalacja pracownik', 'Prefabrykacja prowadzący', 'Prefabrykacja pracownik', 'Prefabrykacja', 'Światłowody', 'Inne', 'Biuro', 'Jędrek', 'Patryk'],
 
                         workerDropdownOpen: false,
-                        entryForm: { worker_id: '', project_id: '', deck_id: '', activities: [], hours: null, description: '' },
+                        entryForm: { worker_id: '', project_id: '', deck_id: '', position_id: '', hours: null, description: '' },
                         stagedEntries: [],
                         isSubmitting: false,
 
                         dateFilterType: 'today',
                         filterDateStart: '', filterDateEnd: '',
+                        analysisProjectSearch: '',
+                        analysisProjectPickerOpen: false,
+                        analysisProjectId: '',
 
                         summaryMonth: localDateString().slice(0, 7),
                         monthlySummary: { total_hours: 0, categories: [] },
@@ -12633,15 +12643,20 @@ def serve_frontend(response: Response):
                         if (!this.entryForm.worker_id) return null;
                         return this.workersStatus.find(w => w.id === this.entryForm.worker_id);
                     },
+                    selectedWorkerUsesActivitiesOnly() {
+                        return this.selectedWorkerInfo?.worker_class === 'Światłowody';
+                    },
+                    availableProjects() {
+                        const workerClass = this.selectedWorkerInfo?.worker_class;
+                        if (!workerClass || workerClass === 'Światłowody') return [];
+                        return this.projects.filter(project => this.projectMatchesWorkerClass(project, workerClass));
+                    },
                     selectedProjectDecks() {
                         const project = this.projects.find(p => Number(p.id) === Number(this.entryForm.project_id));
                         return (project?.decks || []).filter(deck => deck.is_active !== false);
                     },
                     selectedDeck() {
                         return this.selectedProjectDecks.find(deck => Number(deck.id) === Number(this.entryForm.deck_id)) || null;
-                    },
-                    selectedDeckActivities() {
-                        return this.selectedDeck ? this.deckActivityNames(this.selectedDeck) : [];
                     },
                     selectedTargetProject() {
                         if (this.projectTargetId === 'new') return null;
@@ -12652,6 +12667,24 @@ def serve_frontend(response: Response):
                             const entryDate = e.raw_date.split('T')[0];
                             return entryDate >= this.computedStart && entryDate <= this.computedEnd;
                         });
+                    },
+                    selectedAnalysisProject() {
+                        return this.projects.find(project => Number(project.id) === Number(this.analysisProjectId)) || null;
+                    },
+                    analysisProjectOptions() {
+                        const query = this.normalizeWorkerSearch(this.analysisProjectSearch).replace(/^#[ ]*/, '');
+                        const projects = [...this.projects].sort((a, b) => Number(a.id) - Number(b.id));
+                        if (!query) return projects;
+                        if (this.selectedAnalysisProject && this.normalizeWorkerSearch(this.analysisProjectSearch) === this.normalizeWorkerSearch(this.analysisProjectLabel(this.selectedAnalysisProject))) return [this.selectedAnalysisProject];
+                        return projects.filter(project => {
+                            const id = String(project.id);
+                            const text = this.normalizeWorkerSearch(`${project.name} ${project.category}`);
+                            return id.includes(query) || text.includes(query);
+                        });
+                    },
+                    analysisFilteredLogEntries() {
+                        if (!this.analysisProjectId) return this.filteredLogEntries;
+                        return this.filteredLogEntries.filter(entry => Number(entry.project_id) === Number(this.analysisProjectId));
                     },
                     workersByProject() {
                         const grouped = {};
@@ -12672,7 +12705,7 @@ def serve_frontend(response: Response):
                     },
                     reportEntriesByClass() {
                         const groups = {};
-                        this.filteredLogEntries.forEach(entry => {
+                        this.analysisFilteredLogEntries.forEach(entry => {
                             const className = entry.worker_class || 'Inne';
                             if (!groups[className]) groups[className] = { name: className, total_hours: 0, total_meters: 0, entries: [] };
                             groups[className].entries.push(entry);
@@ -12725,15 +12758,14 @@ def serve_frontend(response: Response):
                     getDeck(id) { for (const project of this.projects) { const deck = (project.decks || []).find(item => Number(item.id) === Number(id)); if (deck) return deck; } return null; },
                     getDeckName(id) { return this.getDeck(id)?.name || ''; },
                     getDeckActivity(id) { return this.getDeck(id)?.activity || ''; },
-                    entryActivityNames(entry) {
-                        const names = Array.isArray(entry?.activities) ? entry.activities : [];
-                        return [...new Set(names.map(name => String(name).trim()).filter(Boolean))];
+                    getPositionName(id) { return this.positions.find(position => Number(position.id) === Number(id))?.name || ''; },
+                    isFiberWorkerId(id) { return this.workers.find(worker => Number(worker.id) === Number(id))?.worker_class === 'Światłowody'; },
+                    projectMatchesWorkerClass(project, workerClass) {
+                        if (project.category === workerClass) return true;
+                        if (project.category === 'Instalacja') return String(workerClass).startsWith('Instalacja');
+                        if (project.category === 'Prefabrykacja') return String(workerClass).startsWith('Prefabrykacja');
+                        return false;
                     },
-                    toggleEntryActivity(name, checked) {
-                        const selected = this.entryActivityNames(this.entryForm);
-                        this.entryForm.activities = checked ? [...new Set([...selected, name])] : selected.filter(value => value !== name);
-                    },
-                    getEntryActivityLabel(entry) { return this.entryActivityNames(entry).join(', ') || 'Brak czynności'; },
                     formatHours(value) { return Number(value || 0).toFixed(1); },
                     formatMeters(value) { return Number(value || 0).toFixed(2); },
                     normalizeWorkerSearch(value) {
@@ -12741,6 +12773,31 @@ def serve_frontend(response: Response):
                         const accents = { 'ą': 'a', 'ć': 'c', 'ę': 'e', 'ł': 'l', 'ń': 'n', 'ó': 'o', 'ś': 's', 'ź': 'z', 'ż': 'z' };
                         for (const [letter, replacement] of Object.entries(accents)) result = result.replaceAll(letter, replacement);
                         return result;
+                    },
+                    analysisProjectLabel(project) { return `#${project.id} — ${project.name}`; },
+                    selectAnalysisProject(project) {
+                        this.analysisProjectId = project.id;
+                        this.analysisProjectSearch = this.analysisProjectLabel(project);
+                        this.analysisProjectPickerOpen = false;
+                    },
+                    onAnalysisProjectSearchInput() {
+                        const raw = String(this.analysisProjectSearch || '').trim();
+                        const numeric = raw.replace(/^#[ ]*/, '');
+                        const exact = /^[0-9]+$/.test(numeric) ? this.projects.find(project => String(project.id) === numeric) : null;
+                        if (exact) this.analysisProjectId = exact.id;
+                        else if (!this.selectedAnalysisProject || this.normalizeWorkerSearch(raw) !== this.normalizeWorkerSearch(this.analysisProjectLabel(this.selectedAnalysisProject))) this.analysisProjectId = '';
+                        this.analysisProjectPickerOpen = true;
+                    },
+                    selectFirstAnalysisProject() {
+                        const numeric = String(this.analysisProjectSearch || '').trim().replace(/^#[ ]*/, '');
+                        const exact = /^[0-9]+$/.test(numeric) ? this.projects.find(project => String(project.id) === numeric) : null;
+                        const project = exact || this.analysisProjectOptions[0];
+                        if (project) this.selectAnalysisProject(project);
+                    },
+                    clearAnalysisProject() {
+                        this.analysisProjectSearch = '';
+                        this.analysisProjectId = '';
+                        this.analysisProjectPickerOpen = false;
                     },
                     workerSearchLabel(worker) { return `${worker.first_name} ${worker.last_name} (#${worker.id})`; },
                     workerInitials(worker) { return [worker.first_name, worker.last_name].map(name => Array.from(String(name || '').trim())[0] || '').join('').toLocaleUpperCase('pl'); },
@@ -12776,6 +12833,7 @@ def serve_frontend(response: Response):
                     },
                     onWorkerPickerOutside(event) {
                         if (this.workerPickerOpen && !this.$refs.workerPicker?.contains(event.target)) this.closeWorkerPicker();
+                        if (this.analysisProjectPickerOpen && !this.$refs.analysisProjectPicker?.contains(event.target)) this.analysisProjectPickerOpen = false;
                     },
                     onWorkerPickerFocusOut(event) {
                         if (!event.currentTarget.contains(event.relatedTarget)) this.closeWorkerPicker();
@@ -12839,7 +12897,13 @@ def serve_frontend(response: Response):
                             return total + (Number.isFinite(hours) && hours > 0 ? hours : 0);
                         }, 0).toFixed(2);
                     },
-                    selectWorker(w) { this.entryForm.worker_id = w.id; this.workerDropdownOpen = false; },
+                    selectWorker(w) {
+                        this.entryForm.worker_id = w.id;
+                        this.entryForm.project_id = '';
+                        this.entryForm.deck_id = '';
+                        this.entryForm.position_id = '';
+                        this.workerDropdownOpen = false;
+                    },
                     toggleCard(name) {
                         this.openCards[name] = !this.openCards[name];
                         if (name === 'users' && !this.openCards.users) { this.expandedAccountId = null; this.showNewUserForm = false; }
@@ -12980,12 +13044,19 @@ def serve_frontend(response: Response):
                     },
                     stageEntry() {
                         if(!this.entryForm.worker_id) return this.showToast('Wybierz pracownika', 'error');
-                        if (!this.entryForm.project_id || !this.entryForm.deck_id || !this.entryForm.hours) return this.showToast('Wybierz projekt, pokład i wpisz godziny', 'error');
-                        if (this.selectedDeckActivities.length && !this.entryActivityNames(this.entryForm).length) return this.showToast('Wybierz co najmniej jedną czynność', 'error');
-                        const staged = { ...this.entryForm, activities: this.entryActivityNames(this.entryForm), is_present: true };
+                        if (!this.entryForm.hours) return this.showToast('Wpisz przepracowane godziny', 'error');
+                        if (this.selectedWorkerUsesActivitiesOnly && !this.entryForm.position_id) return this.showToast('Wybierz czynność', 'error');
+                        if (!this.selectedWorkerUsesActivitiesOnly && (!this.entryForm.project_id || !this.entryForm.deck_id)) return this.showToast('Wybierz projekt i pokład', 'error');
+                        const staged = {
+                            ...this.entryForm,
+                            project_id: this.selectedWorkerUsesActivitiesOnly ? null : this.entryForm.project_id,
+                            deck_id: this.selectedWorkerUsesActivitiesOnly ? null : this.entryForm.deck_id,
+                            position_id: this.selectedWorkerUsesActivitiesOnly ? this.entryForm.position_id : null,
+                            is_present: true,
+                        };
                         this.stagedEntries.push(staged);
                         this.showToast('Dodano do listy');
-                        this.entryForm.worker_id = ''; this.entryForm.activities = []; this.entryForm.hours = null; this.entryForm.description = '';
+                        this.entryForm = { worker_id: '', project_id: '', deck_id: '', position_id: '', hours: null, description: '' };
                     },
                     async submitBatch() {
                         if (!this.stagedEntries.length) return;
@@ -13242,11 +13313,12 @@ def serve_frontend(response: Response):
                     },
                     async downloadExcel() {
                         try {
-                            const url = `/api/reports/export?start=${encodeURIComponent(this.computedStart)}&end=${encodeURIComponent(this.computedEnd)}`;
+                            const projectFilter = this.analysisProjectId ? `&project_id=${encodeURIComponent(this.analysisProjectId)}` : '';
+                            const url = `/api/reports/export?start=${encodeURIComponent(this.computedStart)}&end=${encodeURIComponent(this.computedEnd)}${projectFilter}`;
                             const response = await fetch(url, { headers: { 'Authorization': 'Bearer ' + this.token } });
                             if (!response.ok) { const data = await response.json(); throw new Error(data.detail || 'Nie udało się pobrać raportu'); }
                             const blobUrl = URL.createObjectURL(await response.blob());
-                            const link = document.createElement('a'); link.href = blobUrl; link.download = `raport_rcp_${this.computedStart}_${this.computedEnd}.xlsx`; link.click();
+                            const link = document.createElement('a'); link.href = blobUrl; link.download = `raport_rcp_${this.computedStart}_${this.computedEnd}${this.analysisProjectId ? '_projekt_' + this.analysisProjectId : ''}.xlsx`; link.click();
                             URL.revokeObjectURL(blobUrl);
                         } catch(e) { this.showToast(e.message, 'error'); }
                     }
