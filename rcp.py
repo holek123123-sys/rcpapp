@@ -169,6 +169,7 @@ class JobPosition(Base):
     __tablename__ = "job_positions"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
+    scope = Column(String, default="project", nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     entries = relationship("TimeEntry", back_populates="position")
 
@@ -336,6 +337,7 @@ class ProjectResponse(ProjectCreate):
 
 class PositionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=150)
+    scope: str = Field(default="project", pattern="^(project|fiber)$")
 class PositionResponse(PositionCreate):
     id: int
     model_config = ConfigDict(from_attributes=True)
@@ -753,6 +755,8 @@ def run_schema_migrations():
         position_columns = {column["name"] for column in db_inspector.get_columns("job_positions")}
         if "is_active" not in position_columns:
             connection.execute(text("ALTER TABLE job_positions ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        if "scope" not in position_columns:
+            connection.execute(text("ALTER TABLE job_positions ADD COLUMN scope VARCHAR NOT NULL DEFAULT 'project'"))
 
 def link_user_to_worker(db: Session, user: User, worker_id: Optional[int]):
     """Łączy istniejące konto z pracownikiem; nigdy nie tworzy drugiego loginu."""
@@ -1144,7 +1148,10 @@ def add_position(pos: PositionCreate, db: Session = Depends(get_db), _: User = D
     name = pos.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Wpisz nazwę czynności")
-    existing = db.query(JobPosition).filter(func.lower(JobPosition.name) == name.lower()).first()
+    existing = db.query(JobPosition).filter(
+        func.lower(JobPosition.name) == name.lower(),
+        JobPosition.scope == pos.scope,
+    ).first()
     if existing and existing.is_active:
         raise HTTPException(status_code=400, detail="Taka czynność już istnieje")
     if existing:
@@ -1152,7 +1159,7 @@ def add_position(pos: PositionCreate, db: Session = Depends(get_db), _: User = D
         db.commit()
         db.refresh(existing)
         return existing
-    np = JobPosition(name=name)
+    np = JobPosition(name=name, scope=pos.scope)
     db.add(np)
     db.commit()
     db.refresh(np)
@@ -1193,6 +1200,7 @@ def add_entries_batch(payload: BatchTimeEntryCreate, db: Session = Depends(get_d
             position = db.query(JobPosition).filter(
                 JobPosition.id == e.position_id,
                 JobPosition.is_active.is_(True),
+                JobPosition.scope == "fiber",
             ).first()
             if not position:
                 raise HTTPException(status_code=400, detail="Wybrana czynność nie istnieje lub jest nieaktywna")
@@ -11933,7 +11941,7 @@ def serve_frontend(response: Response):
                                         <label class="block text-sm font-bold text-slate-700 mb-2">Czynność</label>
                                         <select v-model="entryForm.position_id" required class="w-full bg-slate-50 border rounded-xl px-4 py-3 font-medium focus:ring-2 focus:ring-emerald-500 outline-none">
                                             <option disabled value="">Wybierz czynność</option>
-                                            <option v-for="position in positions" :key="position.id" :value="position.id">{{ position.name }}</option>
+                                            <option v-for="position in fiberPositions" :key="position.id" :value="position.id">{{ position.name }}</option>
                                         </select>
                                         <p class="mt-2 text-xs font-medium text-slate-500">Dla klasy Światłowody projekt i pokład nie są wymagane.</p>
                                     </div>
@@ -12385,11 +12393,11 @@ def serve_frontend(response: Response):
                                                     <details class="activity-picker relative" :id="'new-deck-activity-' + index">
                                                         <summary :aria-label="'Wybierz czynności pokładu ' + (index + 1)" class="list-none cursor-pointer flex items-center justify-between gap-2 w-full min-w-0 bg-white border rounded-xl px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-purple-500"><span>{{ deckActivityNames(deck).length ? 'Wybrano: ' + deckActivityNames(deck).length : 'Wybierz czynności' }}</span><span aria-hidden="true">▾</span></summary>
                                                         <div role="group" :aria-label="'Lista czynności pokładu ' + (index + 1)" class="absolute left-0 right-0 top-full z-40 mt-1 max-h-56 overflow-y-auto rounded-xl border border-slate-200 bg-white p-2 shadow-xl">
-                                                            <label v-for="activity in positions" :key="activity.id" class="flex min-h-[44px] items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-purple-50">
+                                                            <label v-for="activity in projectPositions" :key="activity.id" class="flex min-h-[44px] items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-purple-50">
                                                                 <input type="checkbox" :checked="deckActivityNames(deck).includes(activity.name)" @change="toggleDeckActivity(deck, activity.name, $event.target.checked)" :disabled="activity.deleting" class="w-4 h-4 shrink-0 accent-purple-600">
                                                                 <span class="min-w-0 break-words">{{ activity.name }}</span>
                                                             </label>
-                                                            <p v-if="!positions.length" class="p-2 text-xs text-slate-500">Lista czynności jest pusta. Dodaj pozycje w sekcji „Czynność”.</p>
+                                                            <p v-if="!projectPositions.length" class="p-2 text-xs text-slate-500">Lista czynności jest pusta. Dodaj pozycje w sekcji „Czynności projektów i pokładów”.</p>
                                                         </div>
                                                     </details>
                                                     <div v-if="deckActivityNames(deck).length" class="mt-2 flex flex-wrap gap-1">
@@ -12401,7 +12409,7 @@ def serve_frontend(response: Response):
                                                 <div class="min-w-0"><label class="block text-[10px] uppercase font-black text-slate-400 mb-1">Przeznaczona ilość godzin (h)</label><input aria-label="Przeznaczona ilość godzin (h)" type="number" min="0" step="0.01" v-model.number="deck.target_hours" placeholder="Wpisz plan, np. 100" class="w-full min-w-0 bg-white border rounded-xl px-3 py-2 font-bold"></div>
                                                 <button type="button" @click="removeNewDeck(index)" :disabled="newProject.decks.length === 1" :aria-label="'Usuń nowy pokład ' + (index + 1)" class="w-12 h-11 justify-self-end text-red-500 rounded-xl hover:bg-red-50 disabled:opacity-30"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
                                             </div>
-                                            <p class="text-xs text-slate-500">{{ positions.length ? 'Możesz zaznaczyć kilka czynności lub pozostawić pusty wybór. Nowe pozycje dodasz niżej w sekcji „Czynność”.' : 'Lista czynności jest pusta. Dodaj pozycje w sekcji „Czynność” lub zapisz pokład bez czynności.' }}</p>
+                                            <p class="text-xs text-slate-500">{{ projectPositions.length ? 'Możesz zaznaczyć kilka czynności lub pozostawić pusty wybór. Nowe pozycje dodasz niżej w sekcji „Czynności projektów i pokładów”.' : 'Lista czynności jest pusta. Dodaj pozycje w sekcji „Czynności projektów i pokładów” lub zapisz pokład bez czynności.' }}</p>
                                         </div>
                                         <div class="rounded-xl border border-sky-100 bg-sky-50 p-4 text-sky-900">
                                             <p class="font-black">Plan godzin projektu po zapisaniu: {{ projectDraftHours() }} h</p>
@@ -12431,16 +12439,29 @@ def serve_frontend(response: Response):
                                     </form>
                                 </div>
 
-                                <!-- Czynność -->
+                                <!-- Czynności projektów i pokładów -->
                                 <div class="bg-white rounded-3xl border p-4 sm:p-6">
-                                    <button @click="toggleCard('newActivity')" class="w-full flex justify-between items-center text-left"><h3 class="text-lg font-black text-slate-800"><i class="fa-solid fa-list-check text-purple-500 mr-2"></i> Czynność</h3><i class="fa-solid fa-chevron-down" :class="openCards.newActivity ? 'rotate-180' : ''"></i></button>
+                                    <button @click="toggleCard('newActivity')" class="w-full flex justify-between items-center text-left"><h3 class="text-lg font-black text-slate-800"><i class="fa-solid fa-list-check text-purple-500 mr-2"></i> Czynności projektów i pokładów</h3><i class="fa-solid fa-chevron-down" :class="openCards.newActivity ? 'rotate-180' : ''"></i></button>
                                     <div v-if="openCards.newActivity" class="space-y-3 mt-6">
                                         <input type="text" v-model="newActivity.name" maxlength="150" placeholder="Nazwa czynności" aria-label="Nazwa czynności" class="w-full bg-slate-50 border rounded-xl px-4 py-3">
-                                        <button @click="addActivity" class="w-full py-3 bg-slate-900 text-white font-bold rounded-xl">Zapisz</button>
-                                        <div v-if="positions.length" class="flex flex-wrap gap-2 pt-2">
-                                            <span v-for="activity in positions" :key="activity.id" class="inline-flex max-w-full items-center gap-1 rounded-lg bg-purple-50 pl-3 text-xs font-bold text-purple-700"><span class="min-w-0 break-words">{{ activity.name }}</span><button type="button" @click="deleteActivity(activity)" :disabled="activity.deleting" :aria-label="'Usuń czynność ' + activity.name" title="Usuń z listy — zapisane pokłady i raporty pozostaną bez zmian" class="h-10 w-10 shrink-0 rounded-lg text-xl hover:bg-red-100 hover:text-red-600 disabled:opacity-50">{{ activity.deleting ? '…' : '×' }}</button></span>
+                                        <button @click="addActivity('project')" class="w-full py-3 bg-slate-900 text-white font-bold rounded-xl">Zapisz</button>
+                                        <div v-if="projectPositions.length" class="flex flex-wrap gap-2 pt-2">
+                                            <span v-for="activity in projectPositions" :key="activity.id" class="inline-flex max-w-full items-center gap-1 rounded-lg bg-purple-50 pl-3 text-xs font-bold text-purple-700"><span class="min-w-0 break-words">{{ activity.name }}</span><button type="button" @click="deleteActivity(activity)" :disabled="activity.deleting" :aria-label="'Usuń czynność ' + activity.name" title="Usuń z listy — zapisane pokłady i raporty pozostaną bez zmian" class="h-10 w-10 shrink-0 rounded-lg text-xl hover:bg-red-100 hover:text-red-600 disabled:opacity-50">{{ activity.deleting ? '…' : '×' }}</button></span>
                                         </div>
                                         <p class="text-xs text-slate-500">Usunięcie czynności z listy nie zmienia zapisanych pokładów ani raportów.</p>
+                                    </div>
+                                </div>
+
+                                <!-- Osobne czynności dla Światłowodów -->
+                                <div class="bg-white rounded-3xl border p-4 sm:p-6">
+                                    <button @click="toggleCard('fiberActivities')" class="w-full flex justify-between items-center text-left"><h3 class="text-lg font-black text-slate-800"><i class="fa-solid fa-network-wired text-cyan-500 mr-2"></i> Czynności — Światłowody</h3><i class="fa-solid fa-chevron-down" :class="openCards.fiberActivities ? 'rotate-180' : ''"></i></button>
+                                    <div v-if="openCards.fiberActivities" class="space-y-3 mt-6">
+                                        <input type="text" v-model="newFiberActivity.name" maxlength="150" placeholder="Nazwa czynności dla światłowodów" aria-label="Nazwa czynności dla światłowodów" class="w-full bg-slate-50 border rounded-xl px-4 py-3">
+                                        <button @click="addActivity('fiber')" class="w-full py-3 bg-cyan-700 text-white font-bold rounded-xl">Zapisz</button>
+                                        <div v-if="fiberPositions.length" class="flex flex-wrap gap-2 pt-2">
+                                            <span v-for="activity in fiberPositions" :key="activity.id" class="inline-flex max-w-full items-center gap-1 rounded-lg bg-cyan-50 pl-3 text-xs font-bold text-cyan-800"><span class="min-w-0 break-words">{{ activity.name }}</span><button type="button" @click="deleteActivity(activity)" :disabled="activity.deleting" :aria-label="'Usuń czynność światłowodową ' + activity.name" title="Usuń z listy — zapisane raporty pozostaną bez zmian" class="h-10 w-10 shrink-0 rounded-lg text-xl hover:bg-red-100 hover:text-red-600 disabled:opacity-50">{{ activity.deleting ? '…' : '×' }}</button></span>
+                                        </div>
+                                        <p class="text-xs text-slate-500">Te czynności pojawiają się wyłącznie podczas raportowania pracowników klasy Światłowody.</p>
                                     </div>
                                 </div>
                             </div>
@@ -12596,13 +12617,14 @@ def serve_frontend(response: Response):
                         expandedSummaryCategories: {},
                         expandedProjects: {},
                         projectDateFilters: {},
-                        openCards: { subscriptions: false, smtp: false, newWorker: false, newProject: false, newActivity: false, users: false },
+                        openCards: { subscriptions: false, smtp: false, newWorker: false, newProject: false, newActivity: false, fiberActivities: false, users: false },
 
                         newWorker: { first_name: '', last_name: '', worker_class: 'Inne', is_active: true, can_report_hours: false, email: '', login_password: '' },
                         isAddingWorker: false,
                         projectTargetId: 'new',
                         newProject: { name: '', category: 'Instalacja', estimated_hours: 0, decks: [{ name: '', activity: '', activities: [], conversion_factor: '', target_m2: '', target_hours: '' }] },
                         newActivity: { name: '' },
+                        newFiberActivity: { name: '' },
                         newUser: { email: '', role: 'manager', password: '', worker_id: '' },
                         newSubscriptionEmail: '',
 
@@ -12645,6 +12667,12 @@ def serve_frontend(response: Response):
                     },
                     selectedWorkerUsesActivitiesOnly() {
                         return this.selectedWorkerInfo?.worker_class === 'Światłowody';
+                    },
+                    projectPositions() {
+                        return this.positions.filter(position => position.scope !== 'fiber');
+                    },
+                    fiberPositions() {
+                        return this.positions.filter(position => position.scope === 'fiber');
                     },
                     projectTypes() {
                         return [...new Set(this.workerClasses.map(workerClass => {
@@ -13280,9 +13308,16 @@ def serve_frontend(response: Response):
                             this.showToast('Pokład zapisany');
                         } catch(e) { this.showToast(e.message, 'error'); }
                     },
-                    async addActivity() {
-                        if (!this.newActivity.name.trim()) return this.showToast('Wpisz nazwę czynności', 'error');
-                        try { await this.api('positions', 'POST', this.newActivity); this.newActivity={name:''}; await this.loadData(); this.showToast('Czynność zapisana'); }
+                    async addActivity(scope = 'project') {
+                        const draft = scope === 'fiber' ? this.newFiberActivity : this.newActivity;
+                        if (!draft.name.trim()) return this.showToast('Wpisz nazwę czynności', 'error');
+                        try {
+                            await this.api('positions', 'POST', { name: draft.name, scope });
+                            if (scope === 'fiber') this.newFiberActivity = {name:''};
+                            else this.newActivity = {name:''};
+                            await this.loadData();
+                            this.showToast(scope === 'fiber' ? 'Czynność dla światłowodów zapisana' : 'Czynność zapisana');
+                        }
                         catch(e) { this.showToast(e.message, 'error'); }
                     },
                     async deleteActivity(activity) {
@@ -13292,7 +13327,7 @@ def serve_frontend(response: Response):
                             const result = await this.api('positions/' + activity.id, 'DELETE');
                             this.positions = this.positions.filter(item => item.id !== activity.id);
                             // Only remove it from unsaved drafts; saved projects/history stay untouched.
-                            for (const deck of this.newProject.decks) this.toggleDeckActivity(deck, activity.name, false);
+                            if (activity.scope !== 'fiber') for (const deck of this.newProject.decks) this.toggleDeckActivity(deck, activity.name, false);
                             this.showToast(result.message || 'Czynność usunięta z listy');
                         } catch (e) { this.showToast(e.message, 'error'); }
                         finally { activity.deleting = false; }
